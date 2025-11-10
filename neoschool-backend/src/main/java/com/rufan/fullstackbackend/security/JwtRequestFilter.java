@@ -1,0 +1,134 @@
+package com.rufan.fullstackbackend.security;
+
+import com.rufan.fullstackbackend.exception.JwtTokenException;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.MalformedJwtException;
+import io.jsonwebtoken.UnsupportedJwtException;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class JwtRequestFilter extends OncePerRequestFilter {
+
+    public static final String AUTHORIZATION_HEADER = "Authorization";
+    public static final String BEARER_PREFIX = "Bearer ";
+    public static final String TOKEN_EXPIRED_HEADER = "Token-Expired";
+
+    private final UserDetailsService userDetailsService;
+    private final JwtTokenUtil jwtTokenUtil;
+    private final TokenBlacklist tokenBlacklist;
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain chain
+    ) throws ServletException, IOException {
+        final String requestPath = request.getRequestURI();
+
+        // Skip filter for login and refresh token endpoints
+        if (requestPath.contains("/api/auth/")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        log.debug("Processing request to: {}", requestPath);
+
+        // Get token from Authorization header
+        String requestTokenHeader = request.getHeader(AUTHORIZATION_HEADER);
+
+        if (requestTokenHeader != null && requestTokenHeader.startsWith(BEARER_PREFIX)) {
+            String jwtToken = requestTokenHeader.substring(BEARER_PREFIX.length());
+
+            try {
+                // Check if token is blacklisted (user logged out)
+                if (tokenBlacklist.isBlacklisted(jwtToken)) {
+                    log.warn("Attempted to use blacklisted token");
+                    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token has been invalidated");
+                    return;
+                }
+
+                // Extract username from token
+                String username = jwtTokenUtil.extractUsername(jwtToken);
+
+                if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                    UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+
+                    // Validate token and set authentication if valid
+                    if (jwtTokenUtil.validateToken(jwtToken, userDetails)) {
+                        UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                                userDetails, null, userDetails.getAuthorities()
+                        );
+                        authentication.setDetails(
+                                new WebAuthenticationDetailsSource().buildDetails(request)
+                        );
+                        SecurityContextHolder.getContext().setAuthentication(authentication);
+                        log.debug("Authenticated user: {}", username);
+
+                        // Debug: Verify the authentication was set correctly
+                        if (log.isDebugEnabled()) {
+                            log.debug("Current authentication in context: {}", 
+                                    SecurityContextHolder.getContext().getAuthentication());
+                            log.debug("Current authorities: {}", 
+                                    SecurityContextHolder.getContext().getAuthentication().getAuthorities());
+                        }
+                    } else {
+                        log.warn("JWT Token validation failed for user: {}", username);
+                    }
+                }
+            } catch (ExpiredJwtException ex) {
+                log.warn("JWT Token has expired: {}", ex.getMessage());
+                response.setHeader(TOKEN_EXPIRED_HEADER, "true");
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "JWT Token has expired");
+                return;
+            } catch (MalformedJwtException ex) {
+                log.error("Invalid JWT token: {}", ex.getMessage());
+                response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Invalid JWT token");
+                return;
+            } catch (UnsupportedJwtException ex) {
+                log.error("Unsupported JWT token: {}", ex.getMessage());
+                response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Unsupported JWT token");
+                return;
+            } catch (IllegalArgumentException ex) {
+                log.error("JWT claims string is empty: {}", ex.getMessage());
+                response.sendError(HttpServletResponse.SC_BAD_REQUEST, "JWT claims string is empty");
+                return;
+            } catch (JwtTokenException ex) {
+                log.error("JWT Token validation failed: {}", ex.getMessage());
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, ex.getMessage());
+                return;
+            } catch (UsernameNotFoundException ex) {
+                log.error("User not found: {}", ex.getMessage());
+                response.sendError(HttpServletResponse.SC_NOT_FOUND, "User not found");
+                return;
+            } catch (Exception ex) {
+                log.error("Authentication error: {}", ex.getMessage(), ex);
+                response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "Authentication error");
+                return;
+            }
+        } else if (!request.getMethod().equals("OPTIONS")) {
+            // Don't log for OPTIONS requests (preflight CORS)
+            log.debug("No JWT token found in request headers");
+        }
+
+        // Continue the filter chain
+        chain.doFilter(request, response);
+    }
+}
